@@ -152,4 +152,7 @@ def create_node_info(roads_path='data/nyc_roads/geo_export_05dcab6d-50ed-427f-aa
 def Groute(G, a, b, reps):
     st, ed = reps.distance(a).argmin(), reps.distance(b).argmin()
     # print(nx.shortest_path(G, source=st, target=ed, weight='weight'))
-    return LineString(reps.loc[nx.shortest_path(G, source=st, target=ed, weight='weight')].geometry.tolist())
+    try:
+        return LineString(reps.loc[nx.shortest_path(G, source=st, target=ed, weight='weight')].geometry.tolist())
+    except:
+        return LineString([a,b])
