@@ -2,89 +2,154 @@ import pandas as pd
 import geopandas as gpd
 import numpy as np
 from datetime import datetime
-from shapely.geometry import LineString, Point
+from shapely.geometry import LineString, Point, MultiPoint, Polygon
 from IPython.display import display, clear_output
 from misc import viz
 from fastdtw import fastdtw
+import networkx as nx
+from tqdm.auto import tqdm
+from sklearn.cluster import DBSCAN
 
-def _candidates(a, b, roads, current_route):
-
+def meanpoints(lst, default=Point((0.0, 0.0))):
     '''
-    This is the function that finds the candidates for the next point in the route.
+    Get mean point of a list of points.
 
     Parameters
     ----------
-    a : Point - the current point
-    b : Point - the ending point
-    roads : GeoDataFrame - the roads dataframe
-    current_route : list - the current route
-    '''
-    # find the roads that intersect with buffered a
-    inter_roads = roads[roads.buffer(2e-4).intersects(a.buffer(2e-4))][['trafdir', 'geometry']]
-    endps = []
+    lst : list
+        list of points
+    default : Point   
+        default value if list is empty
 
-    # this is used to find the endpoints of the roads based on road direction
-    for _,road in inter_roads.iterrows():
+    Returns
+    -------
+    Point
+        mean point
+    '''
+    if len(lst)==0:
+        print('same')
+        return default
+    else:
+        return Point(np.mean([[a.x, a.y] for a in lst], axis=0))
+
+
+def create_graph( roads, reps, save=False ,fname="road_graph.gpickle"):
+    '''
+    Create road network graph based on the linestring roads (for the edges) and the reps (for the nodes).
+
+    Parameters
+    ----------
+
+    roads : gpd.GeoDataFrame
+        roads dataframe
+    reps : gpd.GeoDataFrame
+        nodes dataframe
+    save : bool
+        if True, save the graph to a file
+    fname : str
+        file name to save the graph to
+    
+    Returns
+    -------
+    nx.Graph
+        road network graph
+    '''
+    G = nx.DiGraph()
+    G.add_nodes_from(range(len(reps)))
+    for a,b,c in roads[['start_id','end_id', 'weights']].values:
+        G.add_edge(a, b, weight=c)
+    if save:
+        nx.write_gpickle(G, fname)
+    else:
+        return G
+    
+
+def create_node_info(roads_path='data/nyc_roads/geo_export_05dcab6d-50ed-427f-aae3-61ecc2069210.shp', save=False, road_nodes_fname='roadsfornx.pkl', reps_fname='reps.pkl'):
+    '''
+    Create node information for the road network.
+
+    Parameters
+    ----------
+    roads_path : str
+        path to the roads shapefile
+    save : bool
+        if True, save the node information to a file
+    road_nodes_fname : str
+        file name to save the road network graph to
+    reps_fname : str
+        file name to save the node information to
+
+    Returns
+    -------
+    roads : gpd.GeoDataFrame
+        roads dataframe
+    reps : gpd.GeoDataFrame
+        nodes dataframe
+
+    '''
+    path_to_data = gpd.datasets.get_path("nybb")
+    gdf = gpd.read_file(path_to_data)
+    manh = gdf.loc[gdf.BoroName=='Manhattan'].to_crs(4326)
+
+    roads = gpd.read_file(roads_path, mask=manh)[['trafdir', 'geometry']]
+
+    print('Road directions - starts/stops')
+    notw = roads[roads.trafdir!='TW']
+    tw = roads[roads.trafdir=='TW']
+    tw['trafdir'] = 'TF'
+    tw2 = tw.copy()
+    tw2['trafdir'] = 'FT'
+    roadsv2 = pd.concat([notw, tw, tw2])
+    roadsv2 = roadsv2.loc[roadsv2.trafdir!='NV'].reset_index(drop=True)
+    sps = []
+    eps = []
+    for _,road in roadsv2.iterrows():
         if road.trafdir == 'FT':
-            endps.append(road.geometry.boundary[1])
+            sps.append(road.geometry.boundary[0]) 
+            eps.append(road.geometry.boundary[1]) 
+
         elif road.trafdir == 'TF':
-            endps.append(road.geometry.boundary[0])
-        elif road.trafdir == 'TW':
-            endps.append(road.geometry.boundary[0])
-            endps.append(road.geometry.boundary[1])
-        else:
-            pass # this is a non vehicle road
+            sps.append(road.geometry.boundary[1]) 
+            eps.append(road.geometry.boundary[0]) 
 
-    res = []
-    for point in endps:
+    starts = gpd.GeoDataFrame(geometry=sps, crs=4326)
+    starts['label'] = 'start'
+    stops = gpd.GeoDataFrame(geometry=eps, crs=4326)
+    stops['label'] = 'end'
 
-        if LineString([a,point]).length==0:
-            continue
-        if len(current_route)>1 and LineString(current_route).buffer(1e-4).intersects(point.buffer(1e-4)):
-            continue
+    sall = pd.concat([starts, stops])
+    print('Clustering')
+    X = sall.geometry.apply(lambda a: np.array([a.x, a.y]))
+    X = np.vstack([val for val in X.values])
 
-        # return all the candidates that do not intersect with the current route
-        res.append((Point(point), Point(point).distance(b)))
+    clustering = DBSCAN(eps=1e-4, min_samples=2).fit(X)
+    sall['cls'] = clustering.labels_
 
-    return res
+    print('creating nodes')
+    pnts = gpd.GeoSeries(sall.groupby('cls').apply(lambda a: meanpoints(a.geometry.tolist(),0))[1:], crs=4326)
+
+    for i in tqdm(range(len(roadsv2))):
+        start_p = sall.loc[i].iloc[0].cls
+        end_p = sall.loc[i].iloc[1].cls
+        # break
+        roadsv2.loc[i, 'start2'] = start_p
+        roadsv2.loc[i, 'end2'] = end_p
+
+    rds = roadsv2.loc[(roadsv2.start2!=-1) & (roadsv2.end2!=-1)]
+    rds['weights'] = rds.apply(lambda a: pnts[a.start2].distance(pnts[a.end2]), axis=1)
 
 
-def route(a,b, roads, max_queue_len=-1, result_len=1, routedif=0.001):
-    '''
-    Find a route from a to b. The route is a list of points that can easily form a linestring. 
+    rds = rds.drop(['geometry'], axis=1)
+    rds.rename({'start2':'start_id', 'end2':'end_id'}, axis=1, inplace=True)
+    if save:
+        print('saving...')
+        rds.to_pickle(road_nodes_fname)
+        pnts.to_pickle(reps_fname)
+    else:
+        return rds, pnts
 
-    Parameters
-    ----------
-    a : Point - the starting point
-    b : Point - the ending point
-    roads : GeoDataFrame - the roads dataframe
-    max_queue_len : int - the maximum length of the routes queue. If -1, then the queue is infinite.
-    result_len : int - the number of results you want. If -1, then fetch all (will take a long time)
-    routedif : float - the max DTW distance between two routes to be considered as the similar.
 
-    '''
-    routes = [([a], np.inf)] # priority queue for the routes
-    results = []
-
-    while len(routes)>0 and len(results)<result_len:
-        
-        route, score = routes.pop(0)
-        pnt = route[-1]
-
-        if pnt.distance(b)<0.002:
-            # if route is complete, add it to the results and remove all other routes that are too similar
-            results.append(route)
-            routes = [sroute for sroute in routes if fastdtw([(a.x, a.y) for a in sroute[0]],[(a.x, a.y) for a in route])[0]>routedif]
-            continue
-
-        new_pnts = _candidates(pnt, b, roads, route)
-
-        for new_p, new_score in new_pnts[::-1]:
-            routes.insert(0, (route+[new_p], new_score))
-
-        routes.sort(key=lambda a: a[1])
-        clear_output()
-
-        print(len(routes), len(results), routes[0][1], flush=True)
-        routes = routes[:max_queue_len]
-    return results
+def Groute(G, a, b, reps):
+    st, ed = reps.distance(a).argmin(), reps.distance(b).argmin()
+    # print(nx.shortest_path(G, source=st, target=ed, weight='weight'))
+    return LineString(reps.loc[nx.shortest_path(G, source=st, target=ed, weight='weight')].geometry.tolist())

@@ -3,6 +3,10 @@ data/
 *.key
 *.pdf
 *.png
+*.pickle
+*.pkl
+*.gpickle
+*.gpkl
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
